@@ -11,6 +11,10 @@ import (
 // mergeSessionIDTables lists every table that stores a session id outside the
 // sessions row itself. A machine merge must rewrite the id in each of them so
 // renamed sessions keep their messages, tool calls, usage, and queue state.
+// Trigger-maintained journals (session_project_identity_snapshot_changes,
+// session_deletion_changes) are deliberately absent: revision triggers on the
+// tables above record the merge, and the deletion ledger is written explicitly
+// for renamed ids.
 var mergeSessionIDTables = []string{
 	"messages",
 	"artifact_export_queue",
@@ -25,7 +29,6 @@ var mergeSessionIDTables = []string{
 	"local_session_source_baselines",
 	"session_project_assignments",
 	"session_project_identity_snapshots",
-	"session_deletion_changes",
 	"subagent_parent_repair_queue",
 	"subagent_parent_cleanup_queue",
 	"secret_findings",
@@ -188,6 +191,28 @@ func mergeMachineRowsTx(ctx context.Context, tx *sql.Tx, target, source string) 
 			return fmt.Errorf("rewriting %s.%s: %w", ref.table, ref.column, err)
 		}
 	}
+	// Renamed ids vanish from the archive; record them in the deletion ledger
+	// the same way the sessions DELETE trigger does, so any downstream mirror
+	// prunes the old-prefixed rows once the renamed sessions republish.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO archive_metadata (key, value)
+		VALUES ('session_deletion_publication_revision', '1')
+		ON CONFLICT(key) DO UPDATE SET
+			value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+			updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`); err != nil {
+		return fmt.Errorf("bumping deletion ledger revision for %q: %w", source, err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO session_deletion_changes
+		(session_id, project, revision, deleted)
+		SELECT s.id, s.project, CAST(m.value AS INTEGER), 1
+		FROM sessions s CROSS JOIN archive_metadata m
+		WHERE s.machine = ? AND substr(s.id, 1, ?) = ?
+			AND m.key = 'session_deletion_publication_revision'
+		ON CONFLICT(session_id) DO UPDATE SET
+			project = excluded.project, revision = excluded.revision, deleted = 1`,
+		source, prefixLen, prefix); err != nil {
+		return fmt.Errorf("journaling renamed ids for %q: %w", source, err)
+	}
+
 	if _, err := tx.ExecContext(ctx, `UPDATE sessions
 		SET id = ? || substr(id, ?),
 		    machine = ?,
@@ -227,14 +252,10 @@ func mergeMachineRowsTx(ctx context.Context, tx *sql.Tx, target, source string) 
 		source, target); err != nil {
 		return err
 	}
-	for _, table := range mergeMachineTables {
-		if _, err := tx.ExecContext(ctx,
-			"UPDATE "+table+" SET machine = ? WHERE machine = ?", target, source); err != nil {
-			return fmt.Errorf("merging machine column in %s: %w", table, err)
-		}
-	}
 	// Aggregate observations keep the newest observation of a root, matching
-	// adopt-machine semantics.
+	// adopt-machine semantics. This must run before the machine-column sweep
+	// so a surviving row can never collide with the target key's existing
+	// (project, machine, root_path, git_remote) primary key.
 	for _, pair := range [][2]string{{source, target}, {target, source}} {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM project_identity_observations AS old
 			WHERE old.machine = ? AND EXISTS (
@@ -244,6 +265,12 @@ func mergeMachineRowsTx(ctx context.Context, tx *sql.Tx, target, source string) 
 					AND rtrim(target.observed_at, 'Z') >= rtrim(old.observed_at, 'Z')
 			)`, pair[0], pair[1]); err != nil {
 			return err
+		}
+	}
+	for _, table := range mergeMachineTables {
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE "+table+" SET machine = ? WHERE machine = ?", target, source); err != nil {
+			return fmt.Errorf("merging machine column in %s: %w", table, err)
 		}
 	}
 
@@ -306,7 +333,6 @@ func deleteMergedSessionRowsTx(ctx context.Context, tx *sql.Tx, id string) error
 		"local_session_source_baselines",
 		"session_project_assignments",
 		"session_project_identity_snapshots",
-		"session_deletion_changes",
 		"subagent_parent_repair_queue",
 		"subagent_parent_cleanup_queue",
 		"secret_findings",
@@ -331,11 +357,13 @@ func rewritePrefixedSessionColumnTx(
 	ctx context.Context, tx *sql.Tx, table, column, stringPrefix string, prefixLen int, targetPrefix string,
 ) error {
 	// Collision guard for tables keyed by (session_id[, ...]) whose existing
-	// target rows would clash with rewritten source rows.
+	// target rows would clash with rewritten source rows. The outer row is
+	// aliased so the inner subquery cannot rebind the bare column name to
+	// its own table.
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(
-		`DELETE FROM %s WHERE substr(%s, 1, ?) = ?
-		AND EXISTS (SELECT 1 FROM %s t
-			WHERE t.%s = ? || substr(%s, ?))`,
+		`DELETE FROM %s AS s WHERE substr(s.%s, 1, ?) = ?
+		AND EXISTS (SELECT 1 FROM %s AS t
+			WHERE t.%s = ? || substr(s.%s, ?))`,
 		table, column, table, column, column,
 	), prefixLen, stringPrefix, targetPrefix, prefixLen+1); err != nil {
 		return err
