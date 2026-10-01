@@ -1134,3 +1134,124 @@ func TestPiProviderParsesNoUsageNoTokenUsage(t *testing.T) {
 	assert.Empty(t, msgs[0].TokenUsage,
 		"token usage left empty when message.usage absent")
 }
+
+// TestPiRunContainerParentRecovery pins lineage recovery for pi SDK run
+// transcripts: <project>/<ts>_<parent-uuid>/<run-key>/run-N/session.jsonl.
+// The run header carries neither branchedFrom nor parentSession, so the
+// parent is recovered from the container name and the sibling parent
+// transcript.
+func TestPiRunContainerParentRecovery(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "--Users-jesse-GitHub-whoops--")
+	require.NoError(t, os.MkdirAll(proj, 0o755))
+	parentID := "019f3933-cd1a-736c-b4fc-2eb4e3d40e6b"
+	container := "2026-07-06T20-52-03-994Z_" + parentID
+	parentPath := filepath.Join(proj, container+".jsonl")
+	writeSourceFile(t, parentPath, piProviderFixture(parentID))
+	runPath := filepath.Join(proj, container, "07c22cfe", "run-0", "session.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(runPath), 0o755))
+	runID := "019f3967-727a-7547-b3d3-1639edbc3d3f"
+	writeSourceFile(t, runPath, piProviderFixture(runID))
+
+	provider, ok := NewProvider(AgentPi, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "devbox",
+	})
+	require.True(t, ok)
+
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, discovered, 2)
+
+	sess, _, err := parsePiSessionByPath(t, provider, runPath)
+	require.NoError(t, err)
+	assert.Equal(t, "pi:"+runID, sess.ID)
+	assert.Equal(t, "pi:"+parentID, sess.ParentSessionID,
+		"run transcript links to the container's parent session")
+
+	parent, _, err := parsePiSessionByPath(t, provider, parentPath)
+	require.NoError(t, err)
+	assert.Equal(t, "pi:"+parentID, parent.ID)
+	assert.Empty(t, parent.ParentSessionID)
+}
+
+// TestPiRunContainerParentRecoveryWithoutParentFile pins the fallback when
+// the sibling parent transcript is absent (remote imports mirror only the
+// transcript tree): the session id embedded in the container name stands in
+// for the parent.
+func TestPiRunContainerParentRecoveryWithoutParentFile(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "--Users-jesse-GitHub-whoops--")
+	parentID := "019f3933-cd1a-736c-b4fc-2eb4e3d40e6b"
+	container := "2026-07-06T20-52-03-994Z_" + parentID
+	runPath := filepath.Join(proj, container, "07c22cfe", "run-0", "session.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(runPath), 0o755))
+	runID := "019f3967-727a-7547-b3d3-1639edbc3d3f"
+	writeSourceFile(t, runPath, piProviderFixture(runID))
+
+	provider, ok := NewProvider(AgentPi, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "devbox",
+	})
+	require.True(t, ok)
+
+	sess, _, err := parsePiSessionByPath(t, provider, runPath)
+	require.NoError(t, err)
+	assert.Equal(t, "pi:"+parentID, sess.ParentSessionID,
+		"container name carries the parent session id")
+}
+
+// TestPiForkParentFromTimestampedStem pins that a fork header's path-form
+// parentSession resolves to the parent's session id when the parent
+// transcript is absent, instead of keeping the whole timestamped stem.
+func TestPiForkParentFromTimestampedStem(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "--Users-jesse-GitHub-bs-rationalization-table--")
+	require.NoError(t, os.MkdirAll(proj, 0o755))
+	parentID := "01a03f8e-a2c2-763b-ba23-8e830e90e1ee"
+	container := "2026-08-26T19-31-47-522Z_" + parentID
+	forkID := "01a03fc2-58b0-7065-bfef-646131be1f66"
+	forkPath := filepath.Join(proj, container, "forks",
+		"2026-08-26T20-28-16-432Z_"+forkID+".jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(forkPath), 0o755))
+	writeSourceFile(t, forkPath, strings.Join([]string{
+		`{"type":"session","version":3,"id":"` + forkID + `","timestamp":"2026-08-26T20:28:16.432Z","cwd":"/Users/jesse/GitHub/bs/rationalization-table","parentSession":"/Users/jesse/.pi/agent/sessions/--Users-jesse-GitHub-bs-rationalization-table--/` + container + `.jsonl"}`,
+		`{"type":"message","id":"msg-1","timestamp":"2026-08-26T20:28:16.5Z","message":{"role":"user","content":"fork"}}`,
+		"",
+	}, "\n"))
+
+	provider, ok := NewProvider(AgentPi, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "legacy",
+	})
+	require.True(t, ok)
+
+	sess, _, err := parsePiSessionByPath(t, provider, forkPath)
+	require.NoError(t, err)
+	assert.Equal(t, "pi:"+forkID, sess.ID)
+	assert.Equal(t, "pi:"+parentID, sess.ParentSessionID,
+		"timestamped parent stem reduces to the parent session id")
+}
+
+func parsePiSessionByPath(
+	t *testing.T,
+	provider Provider,
+	path string,
+) (*ParsedSession, []ParsedMessage, error) {
+	t.Helper()
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source: SourceRef{
+			Provider:       AgentPi,
+			Key:            path,
+			DisplayPath:    path,
+			FingerprintKey: path,
+			Opaque:         JSONLSource{Root: filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(path)))), Path: path},
+		},
+		Fingerprint: SourceFingerprint{Key: path, Hash: "abc123"},
+	})
+	require.NoError(t, err)
+	require.True(t, outcome.ResultSetComplete)
+	require.Len(t, outcome.Results, 1)
+	session := outcome.Results[0].Result.Session
+	return &session, outcome.Results[0].Result.Messages, nil
+}

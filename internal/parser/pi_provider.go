@@ -297,15 +297,18 @@ func newPiSourceSet(agent AgentType, roots []string) JSONLSourceSet {
 	}
 
 	// Pi's native session-dir override writes transcripts directly into the
-	// chosen directory; default homes group them by project instead.
+	// chosen directory; default homes group them by project instead. The pi
+	// SDK also nests non-interactive transcripts below the project
+	// directory — forks at <project>/<ts>_<uuid>/forks/<fork>.jsonl and
+	// subagent or workflow runs at
+	// <project>/<ts>_<uuid>/<run-key>/run-N/session.jsonl — so every .jsonl
+	// under the root is a discovery candidate and the IsPiSessionFile
+	// content check filters non-session JSONL that shares the tree.
 	if agent == AgentPi {
 		return NewJSONLSourceSet(agent, roots,
 			WithRecursive(),
 			WithSymlinkFollowing(),
-			WithIncludePath(func(root, path string) bool {
-				return isPiSourcePath(root, path) &&
-					(filepath.Dir(path) == filepath.Clean(root) || IsDirectoryJSONLPath(root, path))
-			}),
+			WithIncludePath(isPiSourcePath),
 			WithProjectHint(func(root, path string) string { return "" }),
 			WithSessionIDFromPath(piSessionIDFromPath),
 			WithContentHashing(),

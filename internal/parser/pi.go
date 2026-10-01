@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -114,6 +115,17 @@ func parsePiLikeSession(
 		if parentID := ompParentHeaderSessionID(path); parentID != "" {
 			parentSessionID = idPrefix + parentID
 			isOMPSubagent = true
+		}
+	}
+
+	// The pi SDK stores non-interactive run transcripts below a container
+	// directory named after the parent transcript:
+	// <project>/<ts>_<parent-uuid>/<run-key>/run-N/session.jsonl. Those
+	// headers carry neither branchedFrom nor parentSession, so lineage is
+	// recovered from the container name and the sibling parent transcript.
+	if agent == AgentPi && parentSessionID == "" {
+		if parentID := piRunParentHeaderSessionID(path); parentID != "" {
+			parentSessionID = idPrefix + parentID
 		}
 	}
 
@@ -362,9 +374,41 @@ func parsePiLikeSession(
 }
 
 func piPersistedPathSessionID(value string) string {
-	base := piPersistedPathBase(value)
-	return strings.TrimSuffix(base, filepath.Ext(base))
+	return persistedPathStem(value)
 }
+
+// persistedPathStem trims the extension from a persisted path or raw id and
+// reduces pi timestamped stems ("<ts>_<uuid>") to the session uuid, so parent
+// linkage matches the parent transcript's header id even when the parent file
+// itself is absent (for example on remote imports where only the transcript
+// tree is mirrored).
+func persistedPathStem(value string) string {
+	base := piPersistedPathBase(value)
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+	if id, ok := piTimestampedStemSessionID(stem); ok {
+		return id
+	}
+	return stem
+}
+
+// piTimestampedStemSessionID reports whether stem is a pi timestamped
+// session stem ("<RFC3339 UTC timestamp with dashes>_<session uuid>", as
+// written by pi v3 for flat one-shot transcripts, fork containers, and run
+// containers) and returns the embedded session id. The strict shapes keep
+// ordinary names — including temporary-directory names that merely contain
+// an underscore — from being mistaken for containers.
+func piTimestampedStemSessionID(stem string) (string, bool) {
+	match := piTimestampedStemPattern.FindStringSubmatch(stem)
+	if match == nil {
+		return "", false
+	}
+	return match[1], true
+}
+
+var piTimestampedStemPattern = regexp.MustCompile(
+	`^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(?:-\d{1,9})?Z_` +
+		`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$`,
+)
 
 func piPersistedPathBase(value string) string {
 	return filepath.Base(strings.ReplaceAll(value, `\`, "/"))
@@ -373,16 +417,53 @@ func piPersistedPathBase(value string) string {
 func primeParentSessionID(childPath, persistedPath string) string {
 	base := piPersistedPathBase(persistedPath)
 	localSibling := filepath.Join(filepath.Dir(childPath), base)
-	if headerID, ok := piSessionHeaderID(localSibling); ok && headerID != "" {
-		return headerID
+	if headerID, ok := piSessionHeaderID(localSibling); ok {
+		// The parent transcript exists next to the child. A v3 header
+		// carries the session id; a v1 transcript has no header id and the
+		// filename stem is authoritative, so keep the full stem.
+		if headerID != "" {
+			return headerID
+		}
+		return strings.TrimSuffix(base, filepath.Ext(base))
 	}
 	if filepath.IsAbs(persistedPath) &&
 		filepath.Clean(persistedPath) != filepath.Clean(localSibling) {
-		if headerID, ok := piSessionHeaderID(persistedPath); ok && headerID != "" {
-			return headerID
+		if headerID, ok := piSessionHeaderID(persistedPath); ok {
+			if headerID != "" {
+				return headerID
+			}
+			return strings.TrimSuffix(base, filepath.Ext(base))
 		}
 	}
-	return strings.TrimSuffix(base, filepath.Ext(base))
+	// The parent transcript is absent (for example on remote imports where
+	// only the transcript tree is mirrored). A pi v3 timestamped stem
+	// embeds the parent's session id; otherwise the stem stands in for it.
+	return persistedPathStem(persistedPath)
+}
+
+// piRunParentHeaderSessionID recovers the parent session id for pi SDK
+// run transcripts stored below a container directory named after the
+// parent transcript: <project>/<ts>_<parent-uuid>/.../session.jsonl. It
+// prefers the sibling parent transcript's header id and falls back to the
+// session id embedded in the container name. It returns "" for paths
+// with no timestamped container ancestor.
+func piRunParentHeaderSessionID(childPath string) string {
+	dir := filepath.Dir(childPath)
+	for {
+		base := filepath.Base(dir)
+		if base == "/" || base == "." || base == string(filepath.Separator) {
+			return ""
+		}
+		if _, ok := piTimestampedStemSessionID(base); ok {
+			parent := filepath.Join(filepath.Dir(dir), base+".jsonl")
+			if headerID, ok := piSessionHeaderID(parent); ok && headerID != "" {
+				return headerID
+			}
+			id, _ := piTimestampedStemSessionID(base)
+			return id
+		}
+		dir = filepath.Dir(dir)
+	}
 }
 
 // parsePiUserMessage parses a message entry with role="user".

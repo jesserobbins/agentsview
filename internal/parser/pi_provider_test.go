@@ -145,9 +145,9 @@ func TestPiProviderSourceMethods(t *testing.T) {
 
 	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
-	require.Len(t, discovered, 2)
-	assert.ElementsMatch(t, []string{sourcePath, rootPath},
-		[]string{discovered[0].DisplayPath, discovered[1].DisplayPath})
+	require.Len(t, discovered, 3)
+	assert.ElementsMatch(t, []string{sourcePath, rootPath, filepath.Join(root, "encoded-cwd", "nested", "deep.jsonl")},
+		[]string{discovered[0].DisplayPath, discovered[1].DisplayPath, discovered[2].DisplayPath})
 
 	plan, err := provider.WatchPlan(t.Context())
 	require.NoError(t, err)
@@ -531,20 +531,39 @@ func TestOMPProviderMapsSubagentChangedPath(t *testing.T) {
 	assert.Equal(t, subPath, changed[0].DisplayPath)
 }
 
-// TestPiProviderRejectsNestedSubagents pins that the depth relaxation is
-// OMP-only: upstream pi keeps the strict <project>/<session>.jsonl layout and
-// never discovers a nested transcript.
-func TestPiProviderRejectsNestedSubagents(t *testing.T) {
+// TestPiProviderDiscoversNestedSDKTranscripts pins that native pi discovery
+// accepts SDK-nested transcripts (forks and <ts>_<uuid>/<run-key>/run-N
+// containers) below the project directory, alongside the strict
+// <project>/<session>.jsonl interactive layout.
+func TestPiProviderDiscoversNestedSDKTranscripts(t *testing.T) {
 	root := t.TempDir()
 	proj := filepath.Join(root, "encoded-cwd")
 	stem := "session-123"
-	writeSourceFile(t, filepath.Join(proj, stem+".jsonl"), piProviderFixture(stem))
-	writeSourceFile(t, filepath.Join(proj, stem, "nested.jsonl"), piProviderFixture("nested"))
+	interactive := filepath.Join(proj, stem+".jsonl")
+	nested := filepath.Join(proj, stem, "nested.jsonl")
+	writeSourceFile(t, interactive, piProviderFixture(stem))
+	writeSourceFile(t, nested, piProviderFixture("nested"))
+	container := "2026-07-06T20-52-03-994Z_019f3933-cd1a-736c-b4fc-2eb4e3d40e6b"
+	run := filepath.Join(proj, container, "07c22cfe", "run-0", "session.jsonl")
+	writeSourceFile(t, run, piProviderFixture("019f3967-727a-7547-b3d3-1639edbc3d3f"))
+	// Non-session JSONL sharing the tree stays filtered by content.
+	writeSourceFile(t, filepath.Join(proj, "testdata.jsonl"), "{}\n")
 
 	provider, ok := NewProvider(AgentPi, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
-	require.Len(t, discovered, 1, "pi ignores nested transcripts")
-	assert.Equal(t, filepath.Join(proj, stem+".jsonl"), discovered[0].DisplayPath)
+	paths := make([]string, 0, len(discovered))
+	for _, source := range discovered {
+		paths = append(paths, source.DisplayPath)
+	}
+	assert.ElementsMatch(t, []string{interactive, nested, run}, paths)
+	require.Len(t, discovered, 3, "non-session JSONL is filtered by content")
+
+	changed, err := provider.SourcesForChangedPath(
+		t.Context(), ChangedPathRequest{Path: run, EventKind: "write", WatchRoot: root},
+	)
+	require.NoError(t, err)
+	require.Len(t, changed, 1)
+	assert.Equal(t, run, changed[0].DisplayPath)
 }
