@@ -1539,3 +1539,23 @@ func TestClaudeSubagentTranscriptPaths(t *testing.T) {
 		})
 	}
 }
+
+// TestProjectJSONLSessionFilesSkipsAppleDoubleSidecars pins that macOS
+// AppleDouble metadata files (._<name>.jsonl) are never discovered as
+// transcripts, so transfers that materialize them cannot create phantom
+// sessions.
+func TestProjectJSONLSessionFilesSkipsAppleDoubleSidecars(t *testing.T) {
+	dir := t.TempDir()
+	proj := filepath.Join(dir, "-Users-alice-code-app")
+	require.NoError(t, os.MkdirAll(proj, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(proj, "session-1.jsonl"), []byte("{}"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proj, "._session-1.jsonl"), []byte("\x00\x05\x16"), 0o644))
+
+	files := ClaudeProjectSessionFiles(dir)
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		paths = append(paths, file.Path)
+	}
+	assert.ElementsMatch(t,
+		[]string{filepath.Join(proj, "session-1.jsonl")}, paths)
+}

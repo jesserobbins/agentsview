@@ -576,6 +576,12 @@ func projectJSONLSessionFiles(
 			if !strings.HasSuffix(name, ".jsonl") {
 				continue
 			}
+			// macOS AppleDouble sidecars (._<name>.jsonl) are resource-fork
+			// metadata, not transcripts. Transfers that materialize them
+			// must not produce phantom sessions.
+			if strings.HasPrefix(name, "._") {
+				continue
+			}
 			stem := strings.TrimSuffix(name, ".jsonl")
 			if wanted != nil {
 				if _, ok := wanted[stem]; !ok {
