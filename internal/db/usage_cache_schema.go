@@ -45,7 +45,14 @@ const (
 	// Version 13 rebuilds facts and rollups with session-scoped Devin
 	// message source identities: bare node_id/step_id values collide
 	// across sessions, so previously deduplicated Devin usage was dropped.
-	usageCacheFormatVersion             = 13
+	// Version 14 rebuilds facts and rollups because stored model ids no
+	// longer carry serving-mode markers (-background, -ballast): the
+	// ingest-time collapse and its migration rewrite message model ids in
+	// the archive, but cached facts still hold the pre-collapse names, and
+	// EffectivePricingDigest hashes pricing rows, not facts, so it cannot
+	// detect the rename. A new generation forces facts and rollups to
+	// rebuild with the collapsed names.
+	usageCacheFormatVersion             = 14
 	usageCacheApplicationID             = 0x41565543
 	usageCacheKind                      = "agentsview-usage-facts"
 	usageCacheRetirementProtocolVersion = 1
