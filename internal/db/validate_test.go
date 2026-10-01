@@ -137,7 +137,7 @@ func TestSelfParentNeverPersists(t *testing.T) {
 	}
 }
 
-func TestBackgroundModeBaseModel(t *testing.T) {
+func TestServingModeBaseModel(t *testing.T) {
 	for _, tc := range []struct {
 		model string
 		want  string
@@ -149,13 +149,19 @@ func TestBackgroundModeBaseModel(t *testing.T) {
 		{"deepseek-4.1-flash-background", "deepseek-4.1-flash"},
 		{"glm-5.2-vision-Background", "glm-5.2-vision"},
 		{"glm-5.2-vision-BACKGROUND", "glm-5.2-vision"},
+		{"glm-5.2-vision-ballast", "glm-5.2-vision"},
+		{"lunaroute-deepseek-v4-flash-ballast", "lunaroute-deepseek-v4-flash"},
+		{"glm-5.2-vision-Ballast", "glm-5.2-vision"},
+		{"glm-5.2-vision-background-ballast", "glm-5.2-vision"},
 		{"background", "background"},
 		{"-background", "-background"},
+		{"-ballast", "-ballast"},
+		{"ballast", "ballast"},
 		{"claude-opus-4-7", "claude-opus-4-7"},
 	} {
-		assert.Equal(t, tc.want, BackgroundModeBaseModel(tc.model), tc.model)
+		assert.Equal(t, tc.want, ServingModeBaseModel(tc.model), tc.model)
 		// Idempotent: collapsing an already-collapsed id changes nothing.
-		assert.Equal(t, tc.want, BackgroundModeBaseModel(BackgroundModeBaseModel(tc.model)), tc.model)
+		assert.Equal(t, tc.want, ServingModeBaseModel(ServingModeBaseModel(tc.model)), tc.model)
 	}
 }
 
@@ -164,7 +170,11 @@ func TestSanitizeCollapsesBackgroundModels(t *testing.T) {
 	SanitizeMessage(&msg)
 	assert.Equal(t, "lunaroute-glm-5.2-vision", msg.Model)
 
-	event := UsageEvent{Model: "deepseek-4.1-flash-background"}
+	event := UsageEvent{Model: "lunaroute-deepseek-v4-flash-ballast"}
+	SanitizeUsageEvent(&event)
+	assert.Equal(t, "lunaroute-deepseek-v4-flash", event.Model)
+
+	event = UsageEvent{Model: "deepseek-4.1-flash-background"}
 	SanitizeUsageEvent(&event)
 	assert.Equal(t, "deepseek-4.1-flash", event.Model)
 }

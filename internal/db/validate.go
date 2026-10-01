@@ -213,7 +213,7 @@ func SanitizeMessage(m *Message) ValidationStats {
 	}
 
 	sanitizeStringField(&m.Model, &stats)
-	m.Model = BackgroundModeBaseModel(m.Model)
+	m.Model = ServingModeBaseModel(m.Model)
 	if ClampModel(&m.Model) {
 		stats.ModelClamped++
 	}
@@ -274,7 +274,7 @@ func SanitizeUsageEvent(ev *UsageEvent) ValidationStats {
 	sanitizeStringField(&ev.DedupKey, &stats)
 
 	sanitizeStringField(&ev.Model, &stats)
-	ev.Model = BackgroundModeBaseModel(ev.Model)
+	ev.Model = ServingModeBaseModel(ev.Model)
 	if ClampModel(&ev.Model) {
 		stats.ModelClamped++
 	}
@@ -428,27 +428,41 @@ func ClampModel(p *string) bool {
 	return true
 }
 
-// backgroundModeSuffix is the trailing marker gateways append to a model
-// id when a request runs on their background queue (lunaroute's
-// "glm-5.2-vision-background"). It selects a serving mode of the same
-// upstream model at the same price, never a distinct model.
-const backgroundModeSuffix = "-background"
+// servingModeSuffixes are the trailing markers gateways append to a model
+// id when a request runs on a background or spare-capacity queue
+// (lunaroute's "glm-5.2-vision-background", "glm-5.2-vision-ballast").
+// They select a serving mode of the same upstream model at the same price,
+// never a distinct model.
+var servingModeSuffixes = []string{
+	"-background",
+	"-ballast",
+}
 
-// BackgroundModeBaseModel removes a trailing "-background" background-mode
-// marker from a model id, collapsing the background variant onto the main
-// model it serves ("glm-5.2-vision-background" -> "glm-5.2-vision",
-// "lunaroute-glm-5.2-vision-background" -> "lunaroute-glm-5.2-vision").
-// Reports that group by model must not split a model on its serving mode;
-// the marker is compared case-insensitively and a bare "-background" is
-// preserved. The transform is idempotent.
-func BackgroundModeBaseModel(model string) string {
-	if len(model) <= len(backgroundModeSuffix) {
-		return model
+// ServingModeBaseModel removes trailing background-mode markers
+// ("-background", "-ballast") from a model id, collapsing the queue variant
+// onto the main model it serves ("glm-5.2-vision-background" ->
+// "glm-5.2-vision", "lunaroute-glm-5.2-vision-ballast" ->
+// "lunaroute-glm-5.2-vision"). Reports that group by model must not split a
+// model on its serving mode; markers are compared case-insensitively and a
+// bare marker-only id is preserved. Repeated markers are all stripped so
+// the transform is idempotent.
+func ServingModeBaseModel(model string) string {
+	for {
+		collapsed := false
+		for _, suffix := range servingModeSuffixes {
+			if len(model) <= len(suffix) {
+				continue
+			}
+			if strings.EqualFold(model[len(model)-len(suffix):], suffix) {
+				model = model[:len(model)-len(suffix)]
+				collapsed = true
+				break
+			}
+		}
+		if !collapsed {
+			return model
+		}
 	}
-	if strings.EqualFold(model[len(model)-len(backgroundModeSuffix):], backgroundModeSuffix) {
-		return model[:len(model)-len(backgroundModeSuffix)]
-	}
-	return model
 }
 
 // ClampParsedTokens bounds a token count to [0, maxPlausibleTokens] and

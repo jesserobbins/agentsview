@@ -181,15 +181,17 @@ func TestCollapseBackgroundModelsMigration(t *testing.T) {
 		(id, session_id, ordinal, role, model, content, content_length)
 		VALUES
 		(?, 'sess-bg', 1, 'assistant', 'lunaroute-glm-5.2-vision-background', 'a', 1),
-		(?, 'sess-bg', 2, 'assistant', 'glm-5.2-vision', 'b', 1)`,
-		msgID+1, msgID+2)
-	require.NoError(t, err, "insert background-model messages")
+		(?, 'sess-bg', 2, 'assistant', 'glm-5.2-vision', 'b', 1),
+		(?, 'sess-bg', 3, 'assistant', 'lunaroute-deepseek-v4-flash-ballast', 'c', 1)`,
+		msgID+1, msgID+2, msgID+3)
+	require.NoError(t, err, "insert mode-variant model messages")
 	_, err = w.Exec(ctx, `INSERT INTO usage_events
 		(id, session_id, message_ordinal, source, model, provider_id)
 		VALUES
 		(1, 'sess-bg', 1, 'pi', 'deepseek-4.1-flash-background', 'lunaroute'),
-		(2, 'sess-bg', 2, 'pi', 'deepseek-4.1-flash', 'lunaroute')`)
-	require.NoError(t, err, "insert background-model usage events")
+		(2, 'sess-bg', 2, 'pi', 'deepseek-4.1-flash', 'lunaroute'),
+		(3, 'sess-bg', 3, 'pi', 'glm-5.2-vision-ballast', 'lunaroute')`)
+	require.NoError(t, err, "insert mode-variant usage events")
 
 	// Open already ran the one-time collapse on the empty tables during
 	// testDB setup; clear the sentinel so it runs against these rows.
@@ -209,7 +211,9 @@ func TestCollapseBackgroundModelsMigration(t *testing.T) {
 		got = append(got, model)
 	}
 	require.NoError(t, rows.Err())
-	assert.Equal(t, []string{"", "lunaroute-glm-5.2-vision", "glm-5.2-vision"}, got)
+	assert.Equal(t, []string{
+		"", "lunaroute-glm-5.2-vision", "glm-5.2-vision", "lunaroute-deepseek-v4-flash",
+	}, got)
 
 	models := map[string]bool{}
 	urows, err := d.getReader().QueryContext(ctx,
@@ -223,16 +227,17 @@ func TestCollapseBackgroundModelsMigration(t *testing.T) {
 	}
 	require.NoError(t, urows.Err())
 	assert.True(t, models["deepseek-4.1-flash"], "usage event collapsed")
+	assert.True(t, models["glm-5.2-vision"], "ballast usage event collapsed")
 	assert.Equal(t, 0, countRows(t, d,
-		`SELECT count(*) FROM usage_events WHERE model LIKE '%-background'`),
-		"no background variants remain")
+		`SELECT count(*) FROM usage_events WHERE model LIKE '%-background' OR model LIKE '%-ballast'`),
+		"no serving-mode variants remain")
 
 	// Second run is a no-op: the sentinel is set. Raw -background rows can
 	// only enter through pre-migration archives; every write path runs
 	// through ValidateAndSanitize, which collapses them at ingest.
 	require.NoError(t, d.collapseBackgroundModelsLocked(ctx, w))
 	assert.Equal(t, 0, countRows(t, d,
-		`SELECT count(*) FROM usage_events WHERE model LIKE '%-background'`))
+		`SELECT count(*) FROM usage_events WHERE model LIKE '%-background' OR model LIKE '%-ballast'`))
 	assert.Equal(t, 1, countRows(t, d,
 		`SELECT count(*) FROM stats WHERE key = ?`, backgroundModelCollapseStatsKey))
 }

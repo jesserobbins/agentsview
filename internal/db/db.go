@@ -3934,15 +3934,17 @@ func (db *DB) markToolCallFieldBackfillDoneLocked(ctx context.Context,
 }
 
 // backgroundModelCollapseStatsKey marks the one-time collapse of stored
-// "-background" model variants onto the main models they serve.
-const backgroundModelCollapseStatsKey = "background_model_collapse_v1"
+// serving-mode model variants onto the main models they serve. The v2 key
+// re-runs the pass when the marker set grows (v1 collapsed only
+// "-background"; v2 adds "-ballast").
+const backgroundModelCollapseStatsKey = "background_model_collapse_v2"
 
 // collapseBackgroundModelsLocked rewrites stored model ids that carry a
-// trailing "-background" background-mode marker to the main model, matching
-// what BackgroundModeBaseModel produces at ingest time from then on. Only
-// messages and usage_events store model ids. Idempotent per database via a
-// stats sentinel: after the collapse no rows match, so later Opens skip the
-// LIKE scan. Caller holds db.mu.
+// trailing serving-mode marker ("-background", "-ballast") to the main
+// model, matching what ServingModeBaseModel produces at ingest time from
+// then on. Only messages and usage_events store model ids. Idempotent per
+// database via a stats sentinel: after the collapse no rows match, so later
+// Opens skip the LIKE scan. Caller holds db.mu.
 func (db *DB) collapseBackgroundModelsLocked(ctx context.Context, w *writerHandle) error {
 	var done int
 	if err := w.QueryRow(ctx,
@@ -3957,16 +3959,26 @@ func (db *DB) collapseBackgroundModelsLocked(ctx context.Context, w *writerHandl
 		return nil
 	}
 	// SQLite's LIKE is case-insensitive for ASCII, mirroring the
-	// case-insensitive suffix comparison in BackgroundModeBaseModel.
-	const strip = `substr(model, 1, length(model) - 11)`
+	// case-insensitive suffix comparison in ServingModeBaseModel. The length
+	// guards keep a bare marker-only id ("-ballast") intact, matching the
+	// helper. The table name is substituted by token replacement because the
+	// statement embeds LIKE patterns, which printf would interpret as
+	// formatting verbs.
+	const collapse = `
+		UPDATE {table} SET model = CASE
+			WHEN model LIKE '%-background' AND length(model) > 11
+				THEN substr(model, 1, length(model) - 11)
+			WHEN model LIKE '%-ballast' AND length(model) > 8
+				THEN substr(model, 1, length(model) - 8)
+			END
+		WHERE (model LIKE '%-background' AND length(model) > 11)
+			   OR (model LIKE '%-ballast' AND length(model) > 8)`
 	if _, err := w.Exec(ctx,
-		`UPDATE messages SET model = `+strip+
-			` WHERE model LIKE '%-background'`); err != nil {
+		strings.ReplaceAll(collapse, "{table}", "messages")); err != nil {
 		return fmt.Errorf("collapsing background models in messages: %w", err)
 	}
 	if _, err := w.Exec(ctx,
-		`UPDATE usage_events SET model = `+strip+
-			` WHERE model LIKE '%-background'`); err != nil {
+		strings.ReplaceAll(collapse, "{table}", "usage_events")); err != nil {
 		return fmt.Errorf("collapsing background models in usage_events: %w", err)
 	}
 	if _, err := w.Exec(ctx,
