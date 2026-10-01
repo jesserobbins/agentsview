@@ -166,3 +166,73 @@ func TestMergeMachineIdentitiesRefusesConflictingWorktreeRules(t *testing.T) {
 	err = d.MergeMachineIdentities(ctx, "installation-key", "legacy", []string{"legacy-root"})
 	assert.ErrorContains(t, err, "conflicting worktree rules")
 }
+
+func TestCollapseBackgroundModelsMigration(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	seedSessionWithMessage(t, d, "sess-bg")
+	var msgID int64
+	require.NoError(t, d.getReader().QueryRowContext(ctx,
+		`SELECT id FROM messages WHERE session_id = 'sess-bg' AND ordinal = 0`,
+	).Scan(&msgID))
+
+	w := d.getWriter()
+	_, err := w.Exec(ctx, `INSERT INTO messages
+		(id, session_id, ordinal, role, model, content, content_length)
+		VALUES
+		(?, 'sess-bg', 1, 'assistant', 'lunaroute-glm-5.2-vision-background', 'a', 1),
+		(?, 'sess-bg', 2, 'assistant', 'glm-5.2-vision', 'b', 1)`,
+		msgID+1, msgID+2)
+	require.NoError(t, err, "insert background-model messages")
+	_, err = w.Exec(ctx, `INSERT INTO usage_events
+		(id, session_id, message_ordinal, source, model, provider_id)
+		VALUES
+		(1, 'sess-bg', 1, 'pi', 'deepseek-4.1-flash-background', 'lunaroute'),
+		(2, 'sess-bg', 2, 'pi', 'deepseek-4.1-flash', 'lunaroute')`)
+	require.NoError(t, err, "insert background-model usage events")
+
+	// Open already ran the one-time collapse on the empty tables during
+	// testDB setup; clear the sentinel so it runs against these rows.
+	_, err = w.Exec(ctx, `DELETE FROM stats WHERE key = ?`,
+		backgroundModelCollapseStatsKey)
+	require.NoError(t, err, "clear collapse sentinel")
+	require.NoError(t, d.collapseBackgroundModelsLocked(ctx, w), "collapse")
+
+	var got []string
+	rows, err := d.getReader().QueryContext(ctx,
+		`SELECT model FROM messages WHERE session_id = 'sess-bg' ORDER BY ordinal`)
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var model string
+		require.NoError(t, rows.Scan(&model))
+		got = append(got, model)
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, []string{"", "lunaroute-glm-5.2-vision", "glm-5.2-vision"}, got)
+
+	models := map[string]bool{}
+	urows, err := d.getReader().QueryContext(ctx,
+		`SELECT model FROM usage_events`)
+	require.NoError(t, err)
+	defer urows.Close()
+	for urows.Next() {
+		var model string
+		require.NoError(t, urows.Scan(&model))
+		models[model] = true
+	}
+	require.NoError(t, urows.Err())
+	assert.True(t, models["deepseek-4.1-flash"], "usage event collapsed")
+	assert.Equal(t, 0, countRows(t, d,
+		`SELECT count(*) FROM usage_events WHERE model LIKE '%-background'`),
+		"no background variants remain")
+
+	// Second run is a no-op: the sentinel is set. Raw -background rows can
+	// only enter through pre-migration archives; every write path runs
+	// through ValidateAndSanitize, which collapses them at ingest.
+	require.NoError(t, d.collapseBackgroundModelsLocked(ctx, w))
+	assert.Equal(t, 0, countRows(t, d,
+		`SELECT count(*) FROM usage_events WHERE model LIKE '%-background'`))
+	assert.Equal(t, 1, countRows(t, d,
+		`SELECT count(*) FROM stats WHERE key = ?`, backgroundModelCollapseStatsKey))
+}

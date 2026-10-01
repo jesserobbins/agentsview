@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"go.kenn.io/agentsview/internal/stringutil"
@@ -212,6 +213,7 @@ func SanitizeMessage(m *Message) ValidationStats {
 	}
 
 	sanitizeStringField(&m.Model, &stats)
+	m.Model = BackgroundModeBaseModel(m.Model)
 	if ClampModel(&m.Model) {
 		stats.ModelClamped++
 	}
@@ -272,6 +274,7 @@ func SanitizeUsageEvent(ev *UsageEvent) ValidationStats {
 	sanitizeStringField(&ev.DedupKey, &stats)
 
 	sanitizeStringField(&ev.Model, &stats)
+	ev.Model = BackgroundModeBaseModel(ev.Model)
 	if ClampModel(&ev.Model) {
 		stats.ModelClamped++
 	}
@@ -423,6 +426,29 @@ func ClampModel(p *string) bool {
 	}
 	*p = stringutil.SafeTruncate(*p, MaxModelLen)
 	return true
+}
+
+// backgroundModeSuffix is the trailing marker gateways append to a model
+// id when a request runs on their background queue (lunaroute's
+// "glm-5.2-vision-background"). It selects a serving mode of the same
+// upstream model at the same price, never a distinct model.
+const backgroundModeSuffix = "-background"
+
+// BackgroundModeBaseModel removes a trailing "-background" background-mode
+// marker from a model id, collapsing the background variant onto the main
+// model it serves ("glm-5.2-vision-background" -> "glm-5.2-vision",
+// "lunaroute-glm-5.2-vision-background" -> "lunaroute-glm-5.2-vision").
+// Reports that group by model must not split a model on its serving mode;
+// the marker is compared case-insensitively and a bare "-background" is
+// preserved. The transform is idempotent.
+func BackgroundModeBaseModel(model string) string {
+	if len(model) <= len(backgroundModeSuffix) {
+		return model
+	}
+	if strings.EqualFold(model[len(model)-len(backgroundModeSuffix):], backgroundModeSuffix) {
+		return model[:len(model)-len(backgroundModeSuffix)]
+	}
+	return model
 }
 
 // ClampParsedTokens bounds a token count to [0, maxPlausibleTokens] and

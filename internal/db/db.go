@@ -2967,6 +2967,9 @@ func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) err
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := db.collapseBackgroundModelsLocked(ctx, w); err != nil {
+		return err
+	}
 	if err := scopeLegacyDevinSourceUUIDsLocked(ctx, w); err != nil {
 		return err
 	}
@@ -3925,6 +3928,55 @@ func (db *DB) markToolCallFieldBackfillDoneLocked(ctx context.Context,
 	); err != nil {
 		return fmt.Errorf(
 			"storing tool_call field backfill marker: %w", err,
+		)
+	}
+	return nil
+}
+
+// backgroundModelCollapseStatsKey marks the one-time collapse of stored
+// "-background" model variants onto the main models they serve.
+const backgroundModelCollapseStatsKey = "background_model_collapse_v1"
+
+// collapseBackgroundModelsLocked rewrites stored model ids that carry a
+// trailing "-background" background-mode marker to the main model, matching
+// what BackgroundModeBaseModel produces at ingest time from then on. Only
+// messages and usage_events store model ids. Idempotent per database via a
+// stats sentinel: after the collapse no rows match, so later Opens skip the
+// LIKE scan. Caller holds db.mu.
+func (db *DB) collapseBackgroundModelsLocked(ctx context.Context, w *writerHandle) error {
+	var done int
+	if err := w.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM stats WHERE key = ?)`,
+		backgroundModelCollapseStatsKey,
+	).Scan(&done); err != nil {
+		return fmt.Errorf(
+			"probing background model collapse marker: %w", err,
+		)
+	}
+	if done != 0 {
+		return nil
+	}
+	// SQLite's LIKE is case-insensitive for ASCII, mirroring the
+	// case-insensitive suffix comparison in BackgroundModeBaseModel.
+	const strip = `substr(model, 1, length(model) - 11)`
+	if _, err := w.Exec(ctx,
+		`UPDATE messages SET model = `+strip+
+			` WHERE model LIKE '%-background'`); err != nil {
+		return fmt.Errorf("collapsing background models in messages: %w", err)
+	}
+	if _, err := w.Exec(ctx,
+		`UPDATE usage_events SET model = `+strip+
+			` WHERE model LIKE '%-background'`); err != nil {
+		return fmt.Errorf("collapsing background models in usage_events: %w", err)
+	}
+	if _, err := w.Exec(ctx,
+		`INSERT INTO stats (key, value)
+		 VALUES (?, 1)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		backgroundModelCollapseStatsKey,
+	); err != nil {
+		return fmt.Errorf(
+			"storing background model collapse marker: %w", err,
 		)
 	}
 	return nil
